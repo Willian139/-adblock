@@ -8,3 +8,4 @@ local.properties
 build.log
 gradle.properties.local.bak
 gradle.properties.github
+*.bak

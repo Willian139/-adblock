@@ -1,0 +1,575 @@
+package com.sportadblock;
+
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.ParcelFileDescriptor;
+
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Set;
+
+public class AdBlockVpnService extends VpnService {
+
+    public static final String ACTION_STOP =
+            "com.sportadblock.STOP";
+
+    private static final String TARGET_PACKAGE =
+            "com.zjwh.android_wh_physicalfitness";
+
+    private static final String DNS_IP = "10.77.0.1";
+    private static final int NOTIFICATION_ID = 1001;
+
+    private static volatile boolean active = false;
+    private static volatile long blockedCount = 0;
+    private static volatile String lastBlocked = "";
+
+    private volatile boolean running = false;
+
+    private ParcelFileDescriptor tun;
+    private Thread worker;
+
+    private final Set<String> blockedDomains = new HashSet<>();
+
+    public static boolean isActive() {
+        return active;
+    }
+
+    public static long getBlockedCount() {
+        return blockedCount;
+    }
+
+    public static String getLastBlocked() {
+        return lastBlocked;
+    }
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null &&
+                ACTION_STOP.equals(intent.getAction())) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
+
+        if (running) {
+            return START_STICKY;
+        }
+
+        createNotificationChannel();
+
+        startForeground(
+                NOTIFICATION_ID,
+                buildNotification("正在启动")
+        );
+
+        try {
+            loadRules();
+
+            Builder builder = new Builder()
+                    .setSession("SportAdBlock")
+                    .setMtu(1500)
+                    .addAddress("10.77.0.2", 32)
+                    .addDnsServer(DNS_IP)
+                    .addRoute(DNS_IP, 32)
+                    .addAllowedApplication(TARGET_PACKAGE);
+
+            tun = builder.establish();
+
+            if (tun == null) {
+                throw new IllegalStateException(
+                        "VPN 创建失败"
+                );
+            }
+
+            running = true;
+            active = true;
+
+            updateNotification("DNS 过滤运行中");
+
+            worker = new Thread(
+                    this::runDnsLoop,
+                    "SportAdBlock-DNS"
+            );
+
+            worker.start();
+
+        } catch (Exception e) {
+            active = false;
+            running = false;
+
+            updateNotification(
+                    "启动失败：" + e.getMessage()
+            );
+
+            stopSelf();
+        }
+
+        return START_NOT_STICKY;
+    }
+
+    private void loadRules() throws Exception {
+        blockedDomains.clear();
+
+        try (InputStream input =
+                     getAssets().open("rules.txt")) {
+
+            byte[] data = new byte[8192];
+            StringBuilder text = new StringBuilder();
+            int n;
+
+            while ((n = input.read(data)) != -1) {
+                text.append(
+                        new String(data, 0, n,
+                                java.nio.charset.StandardCharsets.UTF_8)
+                );
+            }
+
+            for (String line : text.toString().split("\\n")) {
+                String domain = line.trim()
+                        .toLowerCase(Locale.ROOT);
+
+                if (domain.isEmpty() || domain.startsWith("#")) {
+                    continue;
+                }
+
+                if (domain.startsWith("0.0.0.0 ")) {
+                    domain = domain.substring(8).trim();
+                }
+
+                if (domain.startsWith("127.0.0.1 ")) {
+                    domain = domain.substring(10).trim();
+                }
+
+                if (domain.matches(
+                        "[a-z0-9.-]+") &&
+                        !domain.startsWith(".") &&
+                        !domain.endsWith(".")) {
+                    blockedDomains.add(domain);
+                }
+            }
+        }
+
+        if (blockedDomains.isEmpty()) {
+            throw new IllegalStateException(
+                    "广告规则为空，请检查 rules.txt"
+            );
+        }
+    }
+
+    private boolean isBlocked(String domain) {
+        String d = domain.toLowerCase(Locale.ROOT);
+
+        for (String rule : blockedDomains) {
+            if (d.equals(rule) ||
+                    d.endsWith("." + rule)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void runDnsLoop() {
+        byte[] buffer = new byte[32767];
+
+        try (FileInputStream input =
+                     new FileInputStream(tun.getFileDescriptor());
+             FileOutputStream output =
+                     new FileOutputStream(tun.getFileDescriptor())) {
+
+            while (running) {
+                int length = input.read(buffer);
+
+                if (length <= 0) {
+                    continue;
+                }
+
+                byte[] response = handlePacket(buffer, length);
+
+                if (response != null) {
+                    output.write(response);
+                }
+            }
+
+        } catch (Exception e) {
+            if (running) {
+                updateNotification(
+                        "DNS 服务异常：" + e.getMessage()
+                );
+            }
+        }
+    }
+
+    private byte[] handlePacket(byte[] packet, int length) {
+        if (length < 28 ||
+                (packet[0] & 0x0F) < 5 ||
+                (packet[0] >> 4 & 0x0F) != 4 ||
+                (packet[9] & 0xFF) != 17) {
+            return null;
+        }
+
+        int ipHeaderLength =
+                (packet[0] & 0x0F) * 4;
+
+        if (length < ipHeaderLength + 8) {
+            return null;
+        }
+
+        int totalLength =
+                ((packet[2] & 0xFF) << 8) |
+                (packet[3] & 0xFF);
+
+        if (totalLength < ipHeaderLength + 8 ||
+                totalLength > length) {
+            return null;
+        }
+
+        int udpOffset = ipHeaderLength;
+
+        int sourcePort =
+                ((packet[udpOffset] & 0xFF) << 8) |
+                (packet[udpOffset + 1] & 0xFF);
+
+        int destPort =
+                ((packet[udpOffset + 2] & 0xFF) << 8) |
+                (packet[udpOffset + 3] & 0xFF);
+
+        if (destPort != 53) {
+            return null;
+        }
+
+        int udpLength =
+                ((packet[udpOffset + 4] & 0xFF) << 8) |
+                (packet[udpOffset + 5] & 0xFF);
+
+        if (udpLength < 20 ||
+                udpOffset + udpLength > totalLength) {
+            return null;
+        }
+
+        int dnsOffset = udpOffset + 8;
+        int dnsLength = udpLength - 8;
+
+        byte[] query = new byte[dnsLength];
+
+        System.arraycopy(
+                packet, dnsOffset,
+                query, 0, dnsLength
+        );
+
+        DnsQuestion question = parseQuestion(query);
+
+        if (question == null) {
+            return null;
+        }
+
+        byte[] dnsResponse;
+
+        if (isBlocked(question.domain)) {
+            blockedCount++;
+            lastBlocked = question.domain;
+
+            dnsResponse = makeNxDomain(query, question.end);
+        } else {
+            dnsResponse = forwardDns(query);
+
+            if (dnsResponse == null) {
+                dnsResponse = makeServFail(query, question.end);
+            }
+        }
+
+        return buildIpv4UdpResponse(
+                packet,
+                ipHeaderLength,
+                sourcePort,
+                destPort,
+                dnsResponse
+        );
+    }
+
+    private static class DnsQuestion {
+        String domain;
+        int end;
+
+        DnsQuestion(String domain, int end) {
+            this.domain = domain;
+            this.end = end;
+        }
+    }
+
+    private DnsQuestion parseQuestion(byte[] dns) {
+        if (dns.length < 17) {
+            return null;
+        }
+
+        int flags = read16(dns, 2);
+
+        if ((flags & 0x8000) != 0) {
+            return null;
+        }
+
+        if (read16(dns, 4) < 1) {
+            return null;
+        }
+
+        StringBuilder name = new StringBuilder();
+        int pos = 12;
+
+        while (pos < dns.length) {
+            int labelLength = dns[pos++] & 0xFF;
+
+            if (labelLength == 0) {
+                break;
+            }
+
+            if ((labelLength & 0xC0) != 0 ||
+                    labelLength > 63 ||
+                    pos + labelLength > dns.length) {
+                return null;
+            }
+
+            if (name.length() > 0) {
+                name.append('.');
+            }
+
+            name.append(
+                    new String(
+                            dns, pos, labelLength,
+                            java.nio.charset.StandardCharsets.US_ASCII
+                    )
+            );
+
+            pos += labelLength;
+        }
+
+        if (pos + 4 > dns.length) {
+            return null;
+        }
+
+        return new DnsQuestion(
+                name.toString().toLowerCase(Locale.ROOT),
+                pos + 4
+        );
+    }
+
+    private byte[] makeNxDomain(byte[] query, int questionEnd) {
+        byte[] result = new byte[questionEnd];
+
+        System.arraycopy(query, 0, result, 0, questionEnd);
+
+        int queryFlags = read16(query, 2);
+        int flags = 0x8000 | (queryFlags & 0x0100) | 0x0080 | 3;
+
+        write16(result, 2, flags);
+        write16(result, 4, 1);
+        write16(result, 6, 0);
+        write16(result, 8, 0);
+        write16(result, 10, 0);
+
+        return result;
+    }
+
+    private byte[] makeServFail(byte[] query, int questionEnd) {
+        byte[] result = new byte[questionEnd];
+
+        System.arraycopy(query, 0, result, 0, questionEnd);
+
+        int queryFlags = read16(query, 2);
+        int flags = 0x8000 | (queryFlags & 0x0100) | 0x0080 | 2;
+
+        write16(result, 2, flags);
+        write16(result, 4, 1);
+        write16(result, 6, 0);
+        write16(result, 8, 0);
+        write16(result, 10, 0);
+
+        return result;
+    }
+
+    private byte[] forwardDns(byte[] query) {
+        String[] servers = {"1.1.1.1", "8.8.8.8"};
+
+        for (String server : servers) {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                if (!protect(socket)) {
+                    continue;
+                }
+
+                socket.setSoTimeout(2500);
+
+                InetAddress address =
+                        InetAddress.getByName(server);
+
+                DatagramPacket request =
+                        new DatagramPacket(
+                                query, query.length,
+                                address, 53
+                        );
+
+                socket.send(request);
+
+                byte[] buffer = new byte[4096];
+
+                DatagramPacket reply =
+                        new DatagramPacket(buffer, buffer.length);
+
+                socket.receive(reply);
+
+                byte[] result =
+                        new byte[reply.getLength()];
+
+                System.arraycopy(
+                        reply.getData(),
+                        reply.getOffset(),
+                        result, 0, result.length
+                );
+
+                return result;
+
+            } catch (Exception ignored) {
+                // 尝试下一个 DNS 服务器
+            }
+        }
+
+        return null;
+    }
+
+    private byte[] buildIpv4UdpResponse(
+            byte[] request,
+            int ipHeaderLength,
+            int sourcePort,
+            int destPort,
+            byte[] dns) {
+
+        int udpLength = 8 + dns.length;
+        int totalLength = 20 + udpLength;
+
+        byte[] result = new byte[totalLength];
+
+        result[0] = 0x45;
+        result[1] = 0;
+
+        write16(result, 2, totalLength);
+        write16(result, 4, 0);
+        write16(result, 6, 0x4000);
+
+        result[8] = 64;
+        result[9] = 17;
+
+        // Response source = request destination
+        System.arraycopy(request, 16, result, 12, 4);
+
+        // Response destination = request source
+        System.arraycopy(request, 12, result, 16, 4);
+
+        write16(result, 10, checksum(result, 0, 20));
+
+        write16(result, 20, destPort);
+        write16(result, 22, sourcePort);
+        write16(result, 24, udpLength);
+        write16(result, 26, 0);
+
+        System.arraycopy(dns, 0, result, 28, dns.length);
+
+        return result;
+    }
+
+    private static int checksum(byte[] data, int offset, int length) {
+        long sum = 0;
+
+        for (int i = offset; i < offset + length; i += 2) {
+            int value = (data[i] & 0xFF) << 8;
+
+            if (i + 1 < offset + length) {
+                value |= data[i + 1] & 0xFF;
+            }
+
+            sum += value;
+        }
+
+        while ((sum >> 16) != 0) {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+
+        return (int) (~sum) & 0xFFFF;
+    }
+
+    private static int read16(byte[] data, int offset) {
+        return ((data[offset] & 0xFF) << 8) |
+                (data[offset + 1] & 0xFF);
+    }
+
+    private static void write16(
+            byte[] data, int offset, int value) {
+
+        data[offset] = (byte) ((value >> 8) & 0xFF);
+        data[offset + 1] = (byte) (value & 0xFF);
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel channel =
+                    new NotificationChannel(
+                            "sport_adblock",
+                            "运动去广告",
+                            NotificationManager.IMPORTANCE_LOW
+                    );
+
+            getSystemService(NotificationManager.class)
+                    .createNotificationChannel(channel);
+        }
+    }
+
+    private Notification buildNotification(String text) {
+        Notification.Builder builder;
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            builder = new Notification.Builder(
+                    this, "sport_adblock");
+        } else {
+            builder = new Notification.Builder(this);
+        }
+
+        return builder
+                .setContentTitle("运动世界校园去广告")
+                .setContentText(text)
+                .setSmallIcon(android.R.drawable.ic_secure)
+                .setOngoing(true)
+                .build();
+    }
+
+    private void updateNotification(String text) {
+        try {
+            getSystemService(NotificationManager.class)
+                    .notify(NOTIFICATION_ID, buildNotification(text));
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        active = false;
+
+        try {
+            if (tun != null) {
+                tun.close();
+            }
+        } catch (Exception ignored) {
+        }
+
+        super.onDestroy();
+    }
+}

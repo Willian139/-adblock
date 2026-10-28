@@ -1,0 +1,157 @@
+package com.sportadblock;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.net.VpnService;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.view.Gravity;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.TextView;
+
+public class MainActivity extends Activity {
+
+    private static final int VPN_REQUEST = 100;
+
+    private TextView status;
+    private TextView count;
+    private TextView last;
+    private final Handler handler = new Handler();
+
+    private final Runnable refresh = new Runnable() {
+        @Override
+        public void run() {
+            if (AdBlockVpnService.isActive()) {
+                status.setText("状态：过滤运行中");
+            } else {
+                status.setText("状态：未运行");
+            }
+
+            count.setText(
+                    "拦截次数：" +
+                    AdBlockVpnService.getBlockedCount()
+            );
+
+            last.setText(
+                    "最近拦截：" +
+                    (AdBlockVpnService.getLastBlocked().isEmpty()
+                            ? "暂无"
+                            : AdBlockVpnService.getLastBlocked())
+            );
+
+            handler.postDelayed(this, 1000);
+        }
+    };
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setGravity(Gravity.CENTER);
+        layout.setPadding(28, 28, 28, 28);
+
+        TextView title = new TextView(this);
+        title.setText("运动世界校园去广告");
+        title.setTextSize(24);
+        title.setGravity(Gravity.CENTER);
+
+        status = new TextView(this);
+        status.setTextSize(18);
+        status.setPadding(0, 30, 0, 12);
+
+        count = new TextView(this);
+        count.setTextSize(16);
+
+        last = new TextView(this);
+        last.setTextSize(14);
+        last.setPadding(0, 12, 0, 20);
+
+        Button start = new Button(this);
+        start.setText("开启过滤");
+        start.setOnClickListener(v -> {
+            start.setBackgroundTintList(
+                android.content.res.ColorStateList.valueOf(
+                    android.graphics.Color.RED));
+            requestVpn();
+        });
+
+        Button stop = new Button(this);
+        stop.setText("停止过滤");
+        stop.setOnClickListener(v -> {
+            Intent intent = new Intent(
+                    this, AdBlockVpnService.class);
+            intent.setAction(AdBlockVpnService.ACTION_STOP);
+            startService(intent);
+            start.postDelayed(() -> {
+                start.setBackgroundTintList(null);
+            }, 500);
+        });
+
+        TextView note = new TextView(this);
+        note.setText(
+                "仅处理运动世界校园的 IPv4 DNS 查询。\n" +
+                "不会解密 HTTPS；服务端接口内的广告无法通过 DNS 规则过滤。"
+        );
+        note.setTextSize(13);
+        note.setPadding(0, 24, 0, 0);
+
+        layout.addView(title);
+        layout.addView(status);
+        layout.addView(count);
+        layout.addView(last);
+        layout.addView(start);
+        layout.addView(stop);
+        layout.addView(note);
+
+        setContentView(layout);
+    }
+
+    private void requestVpn() {
+        Intent permission = VpnService.prepare(this);
+
+        if (permission != null) {
+            startActivityForResult(permission, VPN_REQUEST);
+        } else {
+            startVpnService();
+        }
+    }
+
+    private void startVpnService() {
+        Intent intent = new Intent(
+                this, AdBlockVpnService.class);
+
+        if (Build.VERSION.SDK_INT >= 26) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(
+            int requestCode, int resultCode, Intent data) {
+
+        super.onActivityResult(requestCode, resultCode, data);
+
+        if (requestCode == VPN_REQUEST &&
+                resultCode == RESULT_OK) {
+            startVpnService();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        handler.post(refresh);
+    }
+
+    @Override
+    protected void onPause() {
+        handler.removeCallbacks(refresh);
+        super.onPause();
+    }
+}
